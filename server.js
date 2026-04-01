@@ -9,12 +9,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Подключение к базе данных
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// Регистрация (без подтверждения email)
+// ===================== РЕГИСТРАЦИЯ =====================
 app.post('/api/register', async (req, res) => {
     const { email, password, name, surname, age, weight } = req.body;
     
@@ -28,15 +29,16 @@ app.post('/api/register', async (req, res) => {
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         
-        await pool.query(
+        const result = await pool.query(
             `INSERT INTO users (email, password, name, surname, age, weight, verified) 
-             VALUES ($1, $2, $3, $4, $5, $6, true)`,
+             VALUES ($1, $2, $3, $4, $5, $6, true) 
+             RETURNING id, email, name, surname, created_at`,
             [email, hashedPassword, name, surname, age, weight]
         );
         
-        res.json({ success: true, message: 'Регистрация успешна' });
+        res.json({ success: true, user: result.rows[0] });
     } catch (err) {
-        console.error(err);
+        console.error('Register error:', err);
         if (err.code === '23505') {
             res.status(400).json({ error: 'Пользователь с таким email уже существует' });
         } else {
@@ -45,7 +47,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// Вход
+// ===================== ВХОД =====================
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     
@@ -70,6 +72,7 @@ app.post('/api/login', async (req, res) => {
         res.json({
             token,
             user: {
+                id: user.id,
                 name: user.name,
                 surname: user.surname,
                 email: user.email,
@@ -77,26 +80,29 @@ app.post('/api/login', async (req, res) => {
             }
         });
     } catch (err) {
-        console.error(err);
+        console.error('Login error:', err);
         res.status(500).json({ error: 'Ошибка сервера' });
     }
 });
 
-// Мидлвэр авторизации
+// ===================== МИДЛВЭР АВТОРИЗАЦИИ =====================
 const authMiddleware = async (req, res, next) => {
     const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Не авторизован' });
+    if (!token) {
+        return res.status(401).json({ error: 'Не авторизован' });
+    }
     
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         req.userId = decoded.id;
         next();
     } catch (err) {
+        console.error('Auth error:', err);
         res.status(401).json({ error: 'Неверный токен' });
     }
 };
 
-// Получение данных пользователя
+// ===================== ПОЛУЧЕНИЕ ДАННЫХ ПОЛЬЗОВАТЕЛЯ =====================
 app.get('/api/user/data', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query(
@@ -110,11 +116,12 @@ app.get('/api/user/data', authMiddleware, async (req, res) => {
             res.json(result.rows[0]);
         }
     } catch (err) {
+        console.error('Get data error:', err);
         res.status(500).json({ error: 'Ошибка загрузки данных' });
     }
 });
 
-// Сохранение данных пользователя
+// ===================== СОХРАНЕНИЕ ДАННЫХ ПОЛЬЗОВАТЕЛЯ =====================
 app.post('/api/user/data', authMiddleware, async (req, res) => {
     const { menu, exercises, checklist, workout_days } = req.body;
     
@@ -132,35 +139,59 @@ app.post('/api/user/data', authMiddleware, async (req, res) => {
         );
         res.json({ success: true });
     } catch (err) {
+        console.error('Save data error:', err);
         res.status(500).json({ error: 'Ошибка сохранения данных' });
     }
 });
 
-// Получение профиля
+// ===================== ПОЛУЧЕНИЕ ПРОФИЛЯ =====================
 app.get('/api/user/profile', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT name, surname, age, weight, subscription FROM users WHERE id = $1',
+            'SELECT name, surname, age, weight, subscription, pro_expires_at, created_at FROM users WHERE id = $1',
             [req.userId]
         );
         res.json(result.rows[0]);
     } catch (err) {
+        console.error('Profile error:', err);
         res.status(500).json({ error: 'Ошибка' });
     }
 });
 
-// Обновление профиля
+// ===================== ОБНОВЛЕНИЕ ПРОФИЛЯ =====================
 app.put('/api/user/profile', authMiddleware, async (req, res) => {
     const { weight, age } = req.body;
     try {
         await pool.query('UPDATE users SET weight = $1, age = $2 WHERE id = $3', [weight, age, req.userId]);
         res.json({ success: true });
     } catch (err) {
+        console.error('Update profile error:', err);
         res.status(500).json({ error: 'Ошибка' });
     }
 });
 
+// ===================== ОБНОВЛЕНИЕ PRO СТАТУСА =====================
+app.post('/api/upgrade-pro', authMiddleware, async (req, res) => {
+    const { expires_at } = req.body;
+    try {
+        await pool.query(
+            'UPDATE users SET subscription = $1, pro_expires_at = $2 WHERE id = $3',
+            ['pro', expires_at, req.userId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Upgrade error:', err);
+        res.status(500).json({ error: 'Ошибка' });
+    }
+});
+
+// ===================== ТЕСТОВЫЙ ЭНДПОИНТ =====================
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', message: 'Fitness backend is running!' });
+});
+
+// ===================== ЗАПУСК =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Сервер запущен на порту ${PORT}`);
+    console.log(`✅ Server is running on port ${PORT}`);
 });
