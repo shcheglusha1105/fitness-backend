@@ -3,6 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -13,6 +14,138 @@ app.use(express.json());
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
+});
+
+// ===================== ЮKASSA НАСТРОЙКИ =====================
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+
+// Функция для создания платежа в ЮKassa
+async function createYookassaPayment(amount, description, returnUrl, metadata) {
+    const auth = Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString('base64');
+    const idempotenceKey = crypto.randomUUID();
+    
+    const response = await fetch('https://api.yookassa.ru/v3/payments', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Idempotence-Key': idempotenceKey,
+            'Authorization': `Basic ${auth}`
+        },
+        body: JSON.stringify({
+            amount: {
+                value: amount,
+                currency: 'RUB'
+            },
+            payment_method_data: {
+                type: 'bank_card'
+            },
+            confirmation: {
+                type: 'redirect',
+                return_url: returnUrl
+            },
+            description: description,
+            capture: true,
+            metadata: metadata
+        })
+    });
+    
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error('YooKassa API error:', errorText);
+        throw new Error(`YooKassa error: ${response.status}`);
+    }
+    
+    return await response.json();
+}
+
+// ===================== СОЗДАНИЕ ПЛАТЕЖА =====================
+app.post('/api/create-payment', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+        return res.status(401).json({ error: 'Не авторизован' });
+    }
+    
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const userId = decoded.id;
+        
+        const payment = await createYookassaPayment(
+            '300.00',
+            'PRO подписка Фитнес-помощник на 365 дней',
+            `${process.env.APP_URL}/payment-success.html`,
+            { userId: userId.toString() }
+        );
+        
+        if (payment.confirmation && payment.confirmation.confirmation_url) {
+            res.json({ confirmation_url: payment.confirmation.confirmation_url });
+        } else {
+            console.error('Invalid payment response:', payment);
+            res.status(500).json({ error: 'Ошибка создания платежа' });
+        }
+    } catch (err) {
+        console.error('Payment error:', err);
+        res.status(500).json({ error: 'Ошибка создания платежа' });
+    }
+});
+
+// ===================== WEBHOOK ДЛЯ ЮKASSA =====================
+app.post('/api/yookassa-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const event = req.body;
+    
+    console.log('Webhook received:', event);
+    
+    if (event.object && event.object.status === 'succeeded') {
+        const userId = event.object.metadata?.userId;
+        if (userId) {
+            const expiresAt = new Date();
+            expiresAt.setDate(expiresAt.getDate() + 365);
+            
+            try {
+                await pool.query(
+                    'UPDATE users SET subscription = $1, pro_expires_at = $2 WHERE id = $3',
+                    ['pro', expiresAt.toISOString(), userId]
+                );
+                console.log(`✅ PRO активирован для пользователя ${userId} до ${expiresAt.toISOString()}`);
+            } catch (err) {
+                console.error('Error updating user subscription:', err);
+            }
+        }
+    }
+    
+    res.json({ ok: true });
+});
+
+// ===================== ПРОВЕРКА СТАТУСА PRO =====================
+app.get('/api/check-pro', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+        return res.status(401).json({ error: 'Не авторизован' });
+    }
+    
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const result = await pool.query(
+            'SELECT subscription, pro_expires_at FROM users WHERE id = $1',
+            [decoded.id]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Пользователь не найден' });
+        }
+        
+        const user = result.rows[0];
+        const isPro = user.subscription === 'pro' && new Date(user.pro_expires_at) > new Date();
+        
+        res.json({
+            isPro: isPro,
+            expires_at: user.pro_expires_at,
+            subscription: user.subscription
+        });
+    } catch (err) {
+        console.error('Check pro error:', err);
+        res.status(401).json({ error: 'Неверный токен' });
+    }
 });
 
 // ===================== РЕГИСТРАЦИЯ =====================
@@ -170,7 +303,7 @@ app.put('/api/user/profile', authMiddleware, async (req, res) => {
     }
 });
 
-// ===================== ОБНОВЛЕНИЕ PRO СТАТУСА =====================
+// ===================== ОБНОВЛЕНИЕ PRO СТАТУСА (для тестов) =====================
 app.post('/api/upgrade-pro', authMiddleware, async (req, res) => {
     const { expires_at } = req.body;
     try {
